@@ -4,6 +4,8 @@ module WebSocketServer where
 import Control.Concurrent.MVar (MVar, readMVar)
 
 import Control.Monad (forever, forM_)
+import Control.Monad.IO.Class (liftIO)
+import Control.Monad.Reader (asks)
 import Control.Monad.State.Lazy (modify, StateT)
 
 import Data.Aeson (encode, ToJSON)
@@ -20,6 +22,8 @@ import Data.Text (Text)
 
 import Network.WebSockets
 
+import Config
+import Context
 import Util
 import WebSockets
 
@@ -34,8 +38,11 @@ deleteWsClient :: Monad m => WsClientId -> StateT WsClients m ()
 deleteWsClient clientId =
   focus wsClients . modify $ IxSet.deleteIx clientId
 
-runWebSocketServer :: Int -> MVar WsClients -> IO ()
-runWebSocketServer port = runServer "0.0.0.0" port . webSocketApp
+runWebSocketServer :: ContextT IO ()
+runWebSocketServer = do
+  port <- asks $ wsServerPort . contextConf
+  clients <- asks contextWsClientsVar
+  liftIO . runServer "0.0.0.0" port $ webSocketApp clients
 
 webSocketApp :: MVar WsClients -> Request -> WebSockets Hybi00 ()
 webSocketApp clients rq = case requestPath rq of

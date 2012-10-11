@@ -15,6 +15,7 @@ import Control.Concurrent hiding (yield)
 import Control.Monad
 import Control.Monad.IO.Class
 import Control.Monad.Random
+import Control.Monad.Reader
 import Control.Monad.State.Class
 import Control.Monad.State.Lazy hiding (mapState)
 
@@ -52,6 +53,7 @@ import Text.Shakespeare.Text
 
 import CmdArgs
 import Config
+import Context
 import Log
 import Ship
 import Util
@@ -66,24 +68,30 @@ main = do
 mainWithConfig :: Config -> IO ()
 mainWithConfig conf = do
   clock <- newClock
+  startTime <- clockGetTime clock
+  wsClientsVar <- newMVar $ WsClients IxSet.empty 0
+  shipsVar <- newMVar $ Ships IxSet.empty 0
+
+  let context = Context conf shipsVar wsClientsVar clock startTime
+
   initLog conf
   notice [st|starting server|]
-  t <- clockGetTime clock
-  c <- newMVar $ WsClients IxSet.empty 0
-  s <- newMVar $ Ships IxSet.empty 0
 
-  forkIO $ shipRegenerator conf s clock t
+  forkIO $ runReaderT shipRegenerator context
   info [st|spawned regeneration spark|]
-  forkIO $ shipMover conf s clock t
+  forkIO $ runReaderT shipMover context
   info [st|spawned movement spark|]
-  forkIO $ runWebSocketServer (wsServerPort conf) c
+  forkIO $ runReaderT runWebSocketServer context
   info [st|spawned websockets spark|]
-  runTCPServer (tcpSettings conf) $ tcpApp conf s c
+  runReaderT runMainServer context
 
-tcpSettings :: Monad m => Config -> ServerSettings m
-tcpSettings conf = serverSettings (serverPort conf) HostAny
+runMainServer :: ContextIO ()
+runMainServer = do
+  port <- asks $ serverPort . contextConf
+  let settings = serverSettings port HostAny
+  runTCPServer settings tcpApp
 
-tcpApp :: Config -> MVar Ships -> MVar WsClients -> Application IO
+tcpApp :: Application ContextIO
 tcpApp conf s c d = do
   notice $ [st|TCP client connected: #{show address}|]
   runPipe $
@@ -99,16 +107,15 @@ tcpApp conf s c d = do
     sink = appSink d
     address = appSockAddr d
 
-appPipe :: Config -> MVar Ships -> MVar WsClients
-        -> SockAddr -> Conduit Text IO Text
-appPipe conf s c a = do
+appPipe :: SockAddr -> Conduit Text ContextIO Text
+appPipe a = do
   joinMsg <- await
   case Text.words <$> joinMsg of
     Just ["join", uname', r, g, b] -> do
       let uname = Text.filter isPrint uname'
       notice [st|player joined: #{uname}|]
       let color = ShipColor (readText r) (readText g) (readText b)
-      runAsUser conf s c uname color
+      runAsUser uname color
     Just _ ->
       error' $ [st|disconnected player #{addr} |] <>
       [st|with indecipherable join message #{show (fromJust joinMsg)}|]
@@ -134,7 +141,7 @@ tellStatus s =
     health = showText (floor $ getL shipHealth s :: Int)
     energy = showText (floor $ getL shipEnergy s :: Int)
 
-tellPos :: Monad m => Config -> Ships -> Ship -> Pipe l i Text u m ()
+tellPos :: Monad m => Ships -> Ship -> Pipe l i Text u (ContextT m) ()
 tellPos conf ss s =
   forM_ (IxSet.toList . getL ships $ ss) . execStateT $ do
     sx <- access shipX
@@ -152,8 +159,8 @@ tellPos conf ss s =
     myy = getL shipY s
     range = shipScanRange conf
 
-shoot :: Config -> MVar Ships -> Double -> Double -> Double -> IO ()
-shoot conf s x y angle = do
+shoot :: MonadIO m => Double -> Double -> Double -> ContextT m ()
+shoot x y angle = do
   info [st|shooting from #{show x},#{show y} at #{show angle} degrees|]
   alterMVar s . focus ships . mapIxState $ do
     sx <- access shipX
@@ -182,7 +189,7 @@ shoot conf s x y angle = do
     y2 = y + range * dy
 
 usingShip :: (MonadIO m, Functor m)
-          => MVar Ships -> ShipId -> (Ship -> m a)-> m a
+          => ShipId -> (Ship -> m a)-> ContextT m a
 usingShip ms sid action = do
   s <- getL ships <$> liftIO (readMVar ms)
   case IxSet.getOne $ s @= sid of
@@ -194,10 +201,10 @@ usingShip ms sid action = do
 shipArray :: ShipId -> Text
 shipArray sid = [st|ship[#{show (unShipId sid)}]|]
 
-withShips :: MonadIO m => StateT Ships IO a -> MVar Ships -> m a
+withShips :: MonadIO m => StateT Ships IO a -> MVar Ships m a
 withShips action ms = alterMVar ms $ action
 
-withShip :: MonadIO m => MVar Ships -> ShipId -> StateT Ship IO a -> m a
+withShip :: MonadIO m => ShipId -> StateT Ship IO a -> ContextT m a
 withShip ms sid action = flip withShips ms . focus (ixLens sid . ships) $ do
     m <- get
     case m of
@@ -206,10 +213,8 @@ withShip ms sid action = flip withShips ms . focus (ixLens sid . ships) $ do
         critical [st|lost ship with id ${unShipId sid} in read-write mode|]
         fail "Invalid ship id"
 
-addUser :: (MonadIO m)
-        => Config -> MVar Ships -> MVar WsClients
-        -> Text -> ShipColor -> m ShipId
-addUser conf s c uname color = do
+addUser :: (MonadIO m) => Text -> ShipColor -> ContextT m ShipId
+addUser uname color = do
   g <- liftIO getStdGen
   tid <- liftIO myThreadId
   flip evalRandT g $ do
@@ -232,18 +237,18 @@ addUser conf s c uname color = do
     width = arenaWidth conf
     height = arenaHeight conf
 
-removeUser :: MVar Ships -> MVar WsClients -> Text -> ShipId -> IO ()
+removeUser :: Text -> ShipId -> ContextT IO ()
 removeUser s c uname sid = do
   notice [st|user #{uname}(#{show (unShipId sid)}) disconnected|]
   alterMVar s . focus ships . modify $ IxSet.deleteIx sid
   wsTellEvent c $ ShipRemoved sid
 
-shipRegenerator :: Config -> MVar Ships
-                -> Clock -> DiffTime -> IO ()
-shipRegenerator conf s clock =
+shipRegenerator :: ContextT IO ()
+shipRegenerator =
   loop
   where
     loop oldTime = do
+      clock <- asks contextClock
       newTime <- clockGetTime clock
       let delta = realToFrac $ newTime - oldTime
       debug [st|regenerate update with frame time #{show delta}|]
@@ -265,8 +270,7 @@ shipRegenerator conf s clock =
       shipEnergy %= min (fromIntegral $ shipMaxEnergy conf)
       shipEnergy %= max 0
 
-shipMover :: Config -> MVar Ships
-          -> Clock -> DiffTime -> IO ()
+shipMover :: MonadIO m => ContextT m ()
 shipMover conf s clock = loop
   where
     loop oldTime = do
@@ -290,7 +294,7 @@ shipMover conf s clock = loop
       shipY %= wrapY
 
 runAsUser :: Config -> MVar Ships -> MVar WsClients
-          -> Text -> ShipColor -> Conduit Text IO Text
+          -> Text -> ShipColor -> Conduit Text ContextIO Text
 runAsUser conf s c uname color = do
   sid <- addUser conf s c uname color
   addCleanup (const $ removeUser s c uname sid) (runAsShipId conf s c uname sid)
@@ -307,8 +311,7 @@ consumeEnergy s sid i action = do
     di = fromIntegral i
 
 wsTellShipL :: (ToJSON a, MonadIO m, Functor m)
-            => MVar Ships -> MVar WsClients -> ShipId
-            -> Lens Ship a -> Text -> m ()
+            => ShipId -> Lens Ship a -> Text -> m ()
 wsTellShipL s c sid l n =
   usingShip s sid (return . getL l) >>=
   liftIO . wsTellState c (shipArray sid <> "." <> n)
