@@ -1,88 +1,27 @@
-{-# LANGUAGE GeneralizedNewtypeDeriving #-}
-{-# LANGUAGE DeriveDataTypeable #-}
 {-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE TemplateHaskell #-}
 module WebSocketServer where
 
-import Control.Concurrent.MVar
+import Control.Concurrent.MVar (MVar, readMVar)
 
-import Control.Monad
-import Control.Monad.State.Class
-import Control.Monad.State.Lazy
+import Control.Monad (forever, forM_)
+import Control.Monad.State.Lazy (modify, StateT)
 
-import Data.Aeson
+import Data.Aeson (encode, ToJSON)
 
 import Data.ByteString (ByteString)
 
-import Data.Data
+import Data.Functor ((<$>))
 
-import Data.Function
+import qualified Data.IxSet as IxSet (deleteIx, insert, toList)
 
-import Data.Functor
-
-import Data.IxSet as IxSet
-
-import Data.Lens
-import Data.Lens.Template
-
-import Data.Ord
+import Data.Lens (focus, getL, (+=))
 
 import Data.Text (Text)
 
 import Network.WebSockets
 
 import Util
-
-newtype WsClientId =
-  WsClientId
-  { unWsClientId :: Integer
-  }
-  deriving (Eq, Ord, Num, Data, Typeable)
-
-data WsClient =
-  WsClient
-  { _wsClientId :: WsClientId
-  , _wsClientSink :: Sink Hybi00
-  } deriving (Typeable)
-
-instance Eq WsClient where
-  (==) = (==) `on` _wsClientId
-
-instance Ord WsClient where
-  compare = comparing _wsClientId
-
-instance Indexable WsClient where
-  empty =
-    ixSet
-    [ ixFun $ return . _wsClientId
-    ]
-
-data WsClients =
-  WsClients
-  { _wsClients :: IxSet WsClient
-  , _wsClientsNextId :: WsClientId
-  }
-
-makeLenses [''WsClient, ''WsClients]
-
-data WsState a =
-  WsState
-  { wsStateName :: Text
-  , wsStateValue :: a
-  }
-
-instance (ToJSON a) => ToJSON (WsState a) where
-  toJSON (WsState name val) =
-    object ["type" .= ("state" :: Text), "what" .= name, "data" .= val]
-
-data WsEvent a =
-  WsEvent
-  { wsEventValue :: a
-  }
-
-instance (ToJSON a) => ToJSON (WsEvent a) where
-  toJSON (WsEvent val) =
-    object ["type" .= ("event" :: Text), "data" .= val]
+import WebSockets
 
 insertWsClient :: Monad m => Sink Hybi00 -> StateT WsClients m WsClient
 insertWsClient sink = do

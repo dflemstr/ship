@@ -55,6 +55,7 @@ import Config
 import Log
 import Ship
 import Util
+import WebSockets
 import WebSocketServer
 
 main :: IO ()
